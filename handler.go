@@ -55,7 +55,6 @@ type EmailHandlerOpts struct {
 	// GetBody is a user-defined function for making custom email body. By default log record text is used.
 	GetBody GetBodyFunc
 	// ConnectionInfo contains information about SMTP server.
-	// Required if SendEmail is nil.
 	ConnectionInfo SMTPConnectionInfo
 	// QueueSize specifies how many records can be queued before logger will have to actually wait for them to be sent
 	// Default: 1
