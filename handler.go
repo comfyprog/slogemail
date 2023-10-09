@@ -56,9 +56,11 @@ type EmailHandlerOpts struct {
 	GetBody GetBodyFunc
 	// ConnectionInfo contains information about SMTP server.
 	ConnectionInfo SMTPConnectionInfo
-	// QueueSize specifies how many records can be queued before logger will have to actually wait for them to be sent
+	async          bool
+	// AsyncQueueSize specifies how many records can be queued before logger will have to actually wait for them to be sent
+	// Ignored if handler is not asynchronous
 	// Default: 1
-	QueueSize int
+	AsyncQueueSize int
 }
 
 // EmailHandler is a log/slog compatible handler that writes log records in text or json to user-provided io.Writer
@@ -77,6 +79,7 @@ type EmailHandler struct {
 	toAddrs       []string
 	json          bool
 	defaultMailer *Mailer
+	async         bool
 	mailC         chan logEmail
 }
 
@@ -100,9 +103,11 @@ func NewCustomHandler(w io.Writer, opts *slog.HandlerOptions, f SendEmailFunc, j
 	return handler
 }
 
-// NewHandler creates a new handler than prints log to supplied io.Writer and
-// also sends them to a simple SMTP server as an email
-func NewHandler(w io.Writer, opts *slog.HandlerOptions, emailOpts EmailHandlerOpts) (*EmailHandler, func(), error) {
+// NewAsyncAsyncHandler creates a new handler than prints log to supplied io.Writer and
+// also asynchronously sends them to a simple SMTP server as an email
+// NewAsyncHandler returns a stopper function that should be called before the application exits,
+// otherwise some log records may be dropped.
+func NewAsyncHandler(w io.Writer, opts *slog.HandlerOptions, emailOpts EmailHandlerOpts) (*EmailHandler, func(), error) {
 	buf := new(bytes.Buffer)
 	var baseHandler slog.Handler
 	if emailOpts.JSON {
@@ -111,8 +116,62 @@ func NewHandler(w io.Writer, opts *slog.HandlerOptions, emailOpts EmailHandlerOp
 		baseHandler = slog.NewTextHandler(buf, opts)
 	}
 
-	if emailOpts.QueueSize == 0 {
-		emailOpts.QueueSize = 1
+	if emailOpts.AsyncQueueSize == 0 {
+		emailOpts.AsyncQueueSize = 1
+	}
+
+	handler := &EmailHandler{
+		enabled:     true,
+		baseHandler: baseHandler,
+		buf:         buf,
+		out:         w,
+		emailLevel:  emailOpts.Level,
+		fromAddr:    emailOpts.FromAddr,
+		toAddrs:     emailOpts.ToAddrs,
+		getSubject:  emailOpts.GetSubject,
+		getBody:     emailOpts.GetBody,
+		json:        emailOpts.JSON,
+		async:       true,
+	}
+
+	mailer, err := NewMailer(emailOpts.ConnectionInfo.Host, emailOpts.ConnectionInfo.Port,
+		emailOpts.ConnectionInfo.Username, emailOpts.ConnectionInfo.Password)
+	if err != nil {
+		return handler, nil, err
+	}
+	handler.defaultMailer = mailer
+
+	handler.mailC = make(chan logEmail, emailOpts.AsyncQueueSize)
+
+	go func() {
+		for e := range handler.mailC {
+			handler.send(e.ctx, e.rec, e.text)
+		}
+	}()
+
+	closeFunc := func() {
+		handler.mu.Lock()
+		defer handler.mu.Unlock()
+		handler.enabled = false
+		close(handler.mailC)
+	}
+
+	return handler, closeFunc, nil
+}
+
+// NewHandler creates a new handler than prints log to supplied io.Writer and
+// also sends them to a simple SMTP server as an email
+func NewHandler(w io.Writer, opts *slog.HandlerOptions, emailOpts EmailHandlerOpts) (*EmailHandler, error) {
+	buf := new(bytes.Buffer)
+	var baseHandler slog.Handler
+	if emailOpts.JSON {
+		baseHandler = slog.NewJSONHandler(buf, opts)
+	} else {
+		baseHandler = slog.NewTextHandler(buf, opts)
+	}
+
+	if emailOpts.AsyncQueueSize == 0 {
+		emailOpts.AsyncQueueSize = 1
 	}
 
 	handler := &EmailHandler{
@@ -131,26 +190,11 @@ func NewHandler(w io.Writer, opts *slog.HandlerOptions, emailOpts EmailHandlerOp
 	mailer, err := NewMailer(emailOpts.ConnectionInfo.Host, emailOpts.ConnectionInfo.Port,
 		emailOpts.ConnectionInfo.Username, emailOpts.ConnectionInfo.Password)
 	if err != nil {
-		return handler, nil, err
+		return handler, err
 	}
 	handler.defaultMailer = mailer
 
-	handler.mailC = make(chan logEmail, emailOpts.QueueSize)
-
-	go func() {
-		for e := range handler.mailC {
-			handler.send(e.ctx, e.rec, e.text)
-		}
-	}()
-
-	closeFunc := func() {
-		handler.mu.Lock()
-		defer handler.mu.Unlock()
-		handler.enabled = false
-		close(handler.mailC)
-	}
-
-	return handler, closeFunc, nil
+	return handler, nil
 }
 
 func (h *EmailHandler) Enabled(ctx context.Context, level slog.Level) bool {
@@ -182,10 +226,14 @@ func (h *EmailHandler) Handle(ctx context.Context, r slog.Record) error {
 		if h.customSend != nil {
 			return h.customSend(ctx, r, text)
 		}
-		h.mailC <- logEmail{
-			ctx:  ctx,
-			rec:  r,
-			text: text,
+		if h.async {
+			h.mailC <- logEmail{
+				ctx:  ctx,
+				rec:  r,
+				text: text,
+			}
+		} else {
+			return h.send(ctx, r, text)
 		}
 	}
 
@@ -193,7 +241,6 @@ func (h *EmailHandler) Handle(ctx context.Context, r slog.Record) error {
 }
 
 func (h *EmailHandler) send(ctx context.Context, r slog.Record, text string) error {
-
 	var subject, body string
 	if h.getSubject != nil {
 		subject = h.getSubject(ctx, r, text)
