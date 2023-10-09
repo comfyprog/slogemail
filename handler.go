@@ -116,7 +116,7 @@ func NewAsyncHandler(w io.Writer, opts *slog.HandlerOptions, emailOpts EmailHand
 		baseHandler = slog.NewTextHandler(buf, opts)
 	}
 
-	if emailOpts.AsyncQueueSize == 0 {
+	if emailOpts.AsyncQueueSize <= 0 {
 		emailOpts.AsyncQueueSize = 1
 	}
 
@@ -142,11 +142,14 @@ func NewAsyncHandler(w io.Writer, opts *slog.HandlerOptions, emailOpts EmailHand
 	handler.defaultMailer = mailer
 
 	handler.mailC = make(chan logEmail, emailOpts.AsyncQueueSize)
+	wg := sync.WaitGroup{}
+	wg.Add(1)
 
 	go func() {
 		for e := range handler.mailC {
 			handler.send(e.ctx, e.rec, e.text)
 		}
+		wg.Done()
 	}()
 
 	closeFunc := func() {
@@ -154,6 +157,7 @@ func NewAsyncHandler(w io.Writer, opts *slog.HandlerOptions, emailOpts EmailHand
 		defer handler.mu.Unlock()
 		handler.enabled = false
 		close(handler.mailC)
+		wg.Wait()
 	}
 
 	return handler, closeFunc, nil
